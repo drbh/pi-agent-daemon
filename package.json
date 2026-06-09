@@ -1,6 +1,6 @@
 {
   "name": "pi-agent-daemon",
-  "version": "0.79.0",
+  "version": "0.79.0+dev.1",
   "description": "Standalone local daemon for Pi coding agent sessions.",
   "license": "MIT",
   "type": "module",

@@ -25,7 +25,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Deno
         uses: denoland/setup-deno@v2
@@ -40,6 +40,9 @@ jobs:
             exit 1
           fi
 
+      - name: Cache dependencies
+        run: deno task cache
+
       - name: E2E
         run: deno task e2e
 
@@ -53,7 +56,7 @@ jobs:
             src/main.ts
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: pi-agent-daemon-${{ matrix.target }}
           path: pi-agent-daemon-${{ matrix.target }}
@@ -64,7 +67,7 @@ jobs:
 
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           merge-multiple: true
 

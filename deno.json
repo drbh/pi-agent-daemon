@@ -1,5 +1,6 @@
 {
   "tasks": {
+    "cache": "deno cache --node-modules-dir=auto src/main.ts tests/e2e.ts",
     "check": "deno check --node-modules-dir=auto src/main.ts",
     "compile": "deno compile -A --node-modules-dir=auto -o dist/pi-agent-daemon src/main.ts",
     "dev": "deno run -A src/main.ts serve --socket /tmp/pi-agent.sock",

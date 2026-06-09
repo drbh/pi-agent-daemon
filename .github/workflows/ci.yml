@@ -15,7 +15,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Deno
         uses: denoland/setup-deno@v2
@@ -30,6 +30,9 @@ jobs:
 
       - name: Check
         run: deno task check
+
+      - name: Cache dependencies
+        run: deno task cache
 
       - name: E2E
         run: deno task e2e

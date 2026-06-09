@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -71,9 +71,9 @@ jobs:
           deno task prepare-release -- \
             --pi-version "${{ steps.versions.outputs.pi_version }}" \
             --daemon-version "${{ steps.versions.outputs.daemon_version }}"
-          deno install --node-modules-dir=auto
           deno fmt
           deno task check
+          deno task cache
           deno task e2e
 
       - name: Create release-prep PR

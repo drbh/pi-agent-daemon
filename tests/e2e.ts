@@ -1,6 +1,7 @@
 const EXPECTED_TEXT = "PI_DAEMON_E2E_OK";
 const TEST_MODEL = "dummy";
 const TEST_PROVIDER = "fake";
+const STARTUP_TIMEOUT_MS = 60_000;
 
 interface RpcRequest {
   id: number;
@@ -257,11 +258,24 @@ class RpcClient {
   }
 }
 
-async function connectWithRetry(socketPath: string): Promise<RpcClient> {
-  const deadline = Date.now() + 10_000;
+async function connectWithRetry(
+  socketPath: string,
+  daemon: Deno.ChildProcess,
+  output: ProcessOutput,
+): Promise<RpcClient> {
+  const deadline = Date.now() + STARTUP_TIMEOUT_MS;
   let lastError: unknown;
 
   while (Date.now() < deadline) {
+    const status = await pollStatus(daemon);
+    if (status) {
+      await output.done;
+      throw new Error(
+        `daemon exited before accepting connections: ${status.code}\n` +
+          formatOutput(output),
+      );
+    }
+
     try {
       const conn = await Deno.connect({ transport: "unix", path: socketPath });
       const client = new RpcClient(conn);
@@ -273,10 +287,13 @@ async function connectWithRetry(socketPath: string): Promise<RpcClient> {
     }
   }
 
-  throw new Error(`failed to connect to daemon: ${lastError}`);
+  throw new Error(
+    `failed to connect to daemon within ${STARTUP_TIMEOUT_MS}ms: ${lastError}\n` +
+      formatOutput(output),
+  );
 }
 
-async function assertDaemonExited(process: Deno.ChildProcess) {
+async function assertDaemonExited(process: Deno.ChildProcess, output: ProcessOutput) {
   const status = await Promise.race([
     process.status,
     delay(5_000).then(() => undefined),
@@ -285,12 +302,12 @@ async function assertDaemonExited(process: Deno.ChildProcess) {
     throw new Error("daemon did not exit after shutdown");
   }
   if (!status.success) {
-    const stderr = await readOutput(process.stderr);
-    throw new Error(`daemon exited with ${status.code}: ${stderr}`);
+    await output.done;
+    throw new Error(`daemon exited with ${status.code}\n${formatOutput(output)}`);
   }
 }
 
-async function stopProcess(process: Deno.ChildProcess) {
+async function stopProcess(process: Deno.ChildProcess, output: ProcessOutput) {
   const status = await Promise.race([
     process.status,
     delay(250).then(() => undefined),
@@ -299,23 +316,77 @@ async function stopProcess(process: Deno.ChildProcess) {
     process.kill("SIGTERM");
     await process.status.catch(() => undefined);
   }
-  process.stdout.cancel().catch(() => undefined);
-  process.stderr.cancel().catch(() => undefined);
+  await output.done;
 }
 
-async function readOutput(stream: ReadableStream<Uint8Array>): Promise<string> {
-  const chunks: Uint8Array[] = [];
-  for await (const chunk of stream) {
-    chunks.push(chunk);
-  }
-  const size = chunks.reduce((total, chunk) => total + chunk.length, 0);
-  const all = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) {
-    all.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return new TextDecoder().decode(all);
+async function pollStatus(
+  process: Deno.ChildProcess,
+): Promise<Deno.CommandStatus | undefined> {
+  return await Promise.race([
+    process.status,
+    delay(0).then(() => undefined),
+  ]);
+}
+
+interface ProcessOutput {
+  stdout: CapturedOutput;
+  stderr: CapturedOutput;
+  done: Promise<void>;
+}
+
+interface CapturedOutput {
+  snapshot(): string;
+  done: Promise<void>;
+}
+
+function captureProcessOutput(process: Deno.ChildProcess): ProcessOutput {
+  const stdout = captureOutput(process.stdout);
+  const stderr = captureOutput(process.stderr);
+  return {
+    stdout,
+    stderr,
+    done: Promise.all([stdout.done, stderr.done]).then(() => {}),
+  };
+}
+
+function captureOutput(stream: ReadableStream<Uint8Array>): CapturedOutput {
+  const decoder = new TextDecoder();
+  const reader = stream.getReader();
+  let output = "";
+
+  const done = (async () => {
+    try {
+      while (true) {
+        const result = await reader.read();
+        if (result.done) {
+          output += decoder.decode();
+          return;
+        }
+        output += decoder.decode(result.value, { stream: true });
+      }
+    } catch (err) {
+      output += `\n[output capture failed: ${err}]\n`;
+    }
+  })();
+
+  return {
+    snapshot: () => output,
+    done,
+  };
+}
+
+function formatOutput(output: ProcessOutput): string {
+  return [
+    "daemon stdout:",
+    trimOutput(output.stdout.snapshot()),
+    "daemon stderr:",
+    trimOutput(output.stderr.snapshot()),
+  ].join("\n");
+}
+
+function trimOutput(output: string): string {
+  const trimmed = output.trim();
+  return trimmed || "<empty>";
 }
 
 async function safeRemove(path: string) {
@@ -345,11 +416,12 @@ async function main() {
     stdout: "piped",
     stderr: "piped",
   }).spawn();
+  const output = captureProcessOutput(daemon);
 
   let client: RpcClient | undefined;
 
   try {
-    client = await connectWithRetry(socketPath);
+    client = await connectWithRetry(socketPath, daemon, output);
     await client.configure(fakeProvider.baseUrl);
     const sessionId = await client.createSession();
     const response = await client.prompt(sessionId, "Return the e2e sentinel.");
@@ -379,13 +451,13 @@ async function main() {
 
     await client.disposeSession(sessionId);
     await client.shutdown();
-    await assertDaemonExited(daemon);
+    await assertDaemonExited(daemon, output);
     console.log("e2e ok");
   } finally {
     client?.close();
     fakeProvider.shutdown();
     await safeRemove(socketPath);
-    await stopProcess(daemon);
+    await stopProcess(daemon, output);
   }
 }
 
