@@ -1,0 +1,14 @@
+[Unit]
+Description=Pi Agent Daemon
+Documentation=https://github.com/drbh/pi-agent-daemon
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/pi-agent-daemon serve --socket %t/pi-agent-daemon.sock --cwd %h
+EnvironmentFile=-%h/.config/pi-agent-daemon/env
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

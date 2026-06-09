@@ -1,0 +1,91 @@
+name: Sync Pi release
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      pi_version:
+        description: "Upstream @earendil-works/pi-coding-agent version. Defaults to latest."
+        required: false
+        type: string
+      daemon_version:
+        description: "Daemon version. Use X.Y.Z or X.Y.Z+dev.N. Defaults to the Pi version."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Resolve versions
+        id: versions
+        env:
+          INPUT_PI_VERSION: ${{ inputs.pi_version }}
+          INPUT_DAEMON_VERSION: ${{ inputs.daemon_version }}
+        run: |
+          set -euo pipefail
+
+          PI_VERSION="${INPUT_PI_VERSION}"
+          if [ -z "$PI_VERSION" ]; then
+            PI_VERSION="$(npm view @earendil-works/pi-coding-agent version)"
+          fi
+
+          DAEMON_VERSION="${INPUT_DAEMON_VERSION:-$PI_VERSION}"
+
+          if [ "$DAEMON_VERSION" != "$PI_VERSION" ] && [[ "$DAEMON_VERSION" != "$PI_VERSION"+dev.* ]]; then
+            echo "daemon_version must be $PI_VERSION or $PI_VERSION+dev.N" >&2
+            exit 1
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/v${DAEMON_VERSION}" >/dev/null 2>&1; then
+            echo "Tag v${DAEMON_VERSION} already exists; nothing to prepare."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BRANCH_VERSION="${DAEMON_VERSION//+/-}"
+
+          echo "pi_version=$PI_VERSION" >> "$GITHUB_OUTPUT"
+          echo "daemon_version=$DAEMON_VERSION" >> "$GITHUB_OUTPUT"
+          echo "branch_version=$BRANCH_VERSION" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare release files
+        if: steps.versions.outputs.skip != 'true'
+        run: |
+          deno task prepare-release -- \
+            --pi-version "${{ steps.versions.outputs.pi_version }}" \
+            --daemon-version "${{ steps.versions.outputs.daemon_version }}"
+          deno install --node-modules-dir=auto
+          deno fmt
+          deno task check
+          deno task e2e
+
+      - name: Create release-prep PR
+        if: steps.versions.outputs.skip != 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: release/pi-agent-${{ steps.versions.outputs.branch_version }}
+          title: "Prepare pi-agent-daemon v${{ steps.versions.outputs.daemon_version }}"
+          commit-message: "Prepare pi-agent-daemon v${{ steps.versions.outputs.daemon_version }}"
+          body: |
+            Prepares `pi-agent-daemon` release `v${{ steps.versions.outputs.daemon_version }}`.
+
+            Upstream Pi agent version: `${{ steps.versions.outputs.pi_version }}`
+
+            After this PR merges, tag `v${{ steps.versions.outputs.daemon_version }}` to publish binaries.

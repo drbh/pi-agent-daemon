@@ -1,0 +1,392 @@
+const EXPECTED_TEXT = "PI_DAEMON_E2E_OK";
+const TEST_MODEL = "dummy";
+const TEST_PROVIDER = "fake";
+
+interface RpcRequest {
+  id: number;
+  method: string;
+  params: Record<string, unknown>;
+}
+
+interface RpcMessage {
+  ready?: boolean;
+  id?: number;
+  event?: string;
+  data?: Record<string, unknown>;
+  result?: Record<string, unknown>;
+  error?: string;
+}
+
+function startFakeOpenAIProvider() {
+  const requests: Array<Record<string, unknown>> = [];
+  const abort = new AbortController();
+  const server = Deno.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    signal: abort.signal,
+    onListen: () => {},
+  }, async (request) => {
+    const url = new URL(request.url);
+    if (request.method !== "POST" || url.pathname !== "/v1/chat/completions") {
+      return new Response("not found", { status: 404 });
+    }
+
+    const body = await request.json() as Record<string, unknown>;
+    requests.push(body);
+
+    if (body.stream === true) {
+      return streamCompletion();
+    }
+
+    return Response.json({
+      id: "chatcmpl-e2e",
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: TEST_MODEL,
+      choices: [{
+        index: 0,
+        message: { role: "assistant", content: EXPECTED_TEXT },
+        finish_reason: "stop",
+      }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    });
+  });
+
+  return {
+    baseUrl: `http://${server.addr.hostname}:${server.addr.port}/v1`,
+    requests,
+    shutdown: () => abort.abort(),
+  };
+}
+
+function streamCompletion(): Response {
+  const encoder = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const chunks = [
+        {
+          id: "chatcmpl-e2e",
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: TEST_MODEL,
+          choices: [{
+            index: 0,
+            delta: { role: "assistant", content: EXPECTED_TEXT },
+            finish_reason: null,
+          }],
+        },
+        {
+          id: "chatcmpl-e2e",
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: TEST_MODEL,
+          choices: [{
+            index: 0,
+            delta: {},
+            finish_reason: "stop",
+          }],
+        },
+      ];
+
+      for (const chunk of chunks) {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+      }
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    },
+  });
+
+  return new Response(body, {
+    headers: {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    },
+  });
+}
+
+class RpcClient {
+  private nextId = 1;
+  private decoder = new TextDecoder();
+  private encoder = new TextEncoder();
+  private buffer = "";
+
+  constructor(private conn: Deno.Conn) {}
+
+  async ready() {
+    const msg = await this.readMessage();
+    if (!msg.ready) {
+      throw new Error(`expected ready frame, got ${JSON.stringify(msg)}`);
+    }
+  }
+
+  configure(baseUrl: string) {
+    return this.request("configure", {
+      providers: {
+        [TEST_PROVIDER]: {
+          baseUrl,
+          apiKey: "test",
+          api: "openai-completions",
+          models: [{
+            id: TEST_MODEL,
+            name: "Dummy",
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 4096,
+            maxTokens: 128,
+            compat: {
+              maxTokensField: "max_tokens",
+              supportsStore: false,
+              supportsUsageInStreaming: false,
+            },
+          }],
+        },
+      },
+    });
+  }
+
+  async createSession(): Promise<string> {
+    const result = await this.request("create_session", {
+      system_prompt: "You are a deterministic e2e test assistant.",
+      tools: [],
+      model: `${TEST_PROVIDER}/${TEST_MODEL}`,
+      cwd: "/tmp",
+    });
+    const sessionId = result.session_id;
+    if (typeof sessionId !== "string") {
+      throw new Error(`missing session_id: ${JSON.stringify(result)}`);
+    }
+    return sessionId;
+  }
+
+  async prompt(sessionId: string, message: string): Promise<{
+    events: string;
+    result: string;
+  }> {
+    const id = this.nextId++;
+    await this.write({
+      id,
+      method: "prompt",
+      params: { session_id: sessionId, message },
+    });
+
+    let events = "";
+    while (true) {
+      const msg = await this.readMessage();
+      if (msg.id !== id) {
+        throw new Error(`unexpected response id: ${JSON.stringify(msg)}`);
+      }
+      if (msg.error) {
+        throw new Error(msg.error);
+      }
+      if (msg.event === "text_delta") {
+        events += String(msg.data?.delta ?? "");
+        continue;
+      }
+      if (msg.result) {
+        return {
+          events,
+          result: String(msg.result.response ?? ""),
+        };
+      }
+    }
+  }
+
+  disposeSession(sessionId: string) {
+    return this.request("dispose_session", { session_id: sessionId });
+  }
+
+  shutdown() {
+    return this.request("shutdown", {});
+  }
+
+  close() {
+    try {
+      this.conn.close();
+    } catch {
+      // already closed
+    }
+  }
+
+  private async request(
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const id = this.nextId++;
+    await this.write({ id, method, params });
+    while (true) {
+      const msg = await this.readMessage();
+      if (msg.id !== id) {
+        throw new Error(`unexpected response id: ${JSON.stringify(msg)}`);
+      }
+      if (msg.error) {
+        throw new Error(msg.error);
+      }
+      if (msg.result) {
+        return msg.result;
+      }
+    }
+  }
+
+  private async write(req: RpcRequest) {
+    const bytes = this.encoder.encode(`${JSON.stringify(req)}\n`);
+    let written = 0;
+    while (written < bytes.length) {
+      written += await this.conn.write(bytes.subarray(written));
+    }
+  }
+
+  private async readMessage(): Promise<RpcMessage> {
+    while (true) {
+      const newline = this.buffer.indexOf("\n");
+      if (newline >= 0) {
+        const line = this.buffer.slice(0, newline).trim();
+        this.buffer = this.buffer.slice(newline + 1);
+        if (line) {
+          return JSON.parse(line) as RpcMessage;
+        }
+      }
+
+      const chunk = new Uint8Array(1024 * 64);
+      const n = await this.conn.read(chunk);
+      if (n === null) {
+        throw new Error("daemon closed the RPC connection");
+      }
+      this.buffer += this.decoder.decode(chunk.subarray(0, n), { stream: true });
+    }
+  }
+}
+
+async function connectWithRetry(socketPath: string): Promise<RpcClient> {
+  const deadline = Date.now() + 10_000;
+  let lastError: unknown;
+
+  while (Date.now() < deadline) {
+    try {
+      const conn = await Deno.connect({ transport: "unix", path: socketPath });
+      const client = new RpcClient(conn);
+      await client.ready();
+      return client;
+    } catch (err) {
+      lastError = err;
+      await delay(100);
+    }
+  }
+
+  throw new Error(`failed to connect to daemon: ${lastError}`);
+}
+
+async function assertDaemonExited(process: Deno.ChildProcess) {
+  const status = await Promise.race([
+    process.status,
+    delay(5_000).then(() => undefined),
+  ]);
+  if (!status) {
+    throw new Error("daemon did not exit after shutdown");
+  }
+  if (!status.success) {
+    const stderr = await readOutput(process.stderr);
+    throw new Error(`daemon exited with ${status.code}: ${stderr}`);
+  }
+}
+
+async function stopProcess(process: Deno.ChildProcess) {
+  const status = await Promise.race([
+    process.status,
+    delay(250).then(() => undefined),
+  ]);
+  if (!status) {
+    process.kill("SIGTERM");
+    await process.status.catch(() => undefined);
+  }
+  process.stdout.cancel().catch(() => undefined);
+  process.stderr.cancel().catch(() => undefined);
+}
+
+async function readOutput(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of stream) {
+    chunks.push(chunk);
+  }
+  const size = chunks.reduce((total, chunk) => total + chunk.length, 0);
+  const all = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    all.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return new TextDecoder().decode(all);
+}
+
+async function safeRemove(path: string) {
+  try {
+    await Deno.remove(path);
+  } catch {
+    // absent
+  }
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function main() {
+  const fakeProvider = startFakeOpenAIProvider();
+  const socketPath = `/tmp/pi-agent-daemon-e2e-${crypto.randomUUID()}.sock`;
+  const daemon = new Deno.Command(Deno.execPath(), {
+    args: [
+      "run",
+      "-A",
+      "src/main.ts",
+      "serve",
+      "--socket",
+      socketPath,
+    ],
+    stdout: "piped",
+    stderr: "piped",
+  }).spawn();
+
+  let client: RpcClient | undefined;
+
+  try {
+    client = await connectWithRetry(socketPath);
+    await client.configure(fakeProvider.baseUrl);
+    const sessionId = await client.createSession();
+    const response = await client.prompt(sessionId, "Return the e2e sentinel.");
+
+    if (!response.events.includes(EXPECTED_TEXT)) {
+      throw new Error(
+        `missing streamed sentinel: ${JSON.stringify(response.events)}`,
+      );
+    }
+    if (response.result !== EXPECTED_TEXT) {
+      throw new Error(`unexpected final response: ${JSON.stringify(response.result)}`);
+    }
+    if (fakeProvider.requests.length < 1) {
+      throw new Error(
+        `expected at least one provider request, got ${fakeProvider.requests.length}`,
+      );
+    }
+
+    for (const providerRequest of fakeProvider.requests) {
+      if (providerRequest.model !== TEST_MODEL) {
+        throw new Error(`unexpected provider model: ${providerRequest.model}`);
+      }
+      if (providerRequest.stream !== true) {
+        throw new Error("expected streaming chat-completions request");
+      }
+    }
+
+    await client.disposeSession(sessionId);
+    await client.shutdown();
+    await assertDaemonExited(daemon);
+    console.log("e2e ok");
+  } finally {
+    client?.close();
+    fakeProvider.shutdown();
+    await safeRemove(socketPath);
+    await stopProcess(daemon);
+  }
+}
+
+await main();

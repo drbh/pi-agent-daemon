@@ -1,0 +1,20 @@
+[Unit]
+Description=Pi Agent Daemon
+Documentation=https://github.com/drbh/pi-agent-daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi-agent
+Group=pi-agent
+RuntimeDirectory=pi-agent-daemon
+StateDirectory=pi-agent-daemon
+WorkingDirectory=/var/lib/pi-agent-daemon
+EnvironmentFile=-/etc/pi-agent-daemon/env
+ExecStart=/usr/local/bin/pi-agent-daemon serve --socket /run/pi-agent-daemon/pi-agent-daemon.sock --cwd /var/lib/pi-agent-daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.pi-agent.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>/usr/local/bin/pi-agent-daemon</string>
+      <string>serve</string>
+      <string>--socket</string>
+      <string>/tmp/pi-agent-daemon.sock</string>
+      <string>--cwd</string>
+      <string>/Users/YOUR_USER</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USER</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/pi-agent-daemon.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/pi-agent-daemon.err.log</string>
+  </dict>
+</plist>
