@@ -1,12 +1,12 @@
 {
   "name": "pi-agent-daemon",
-  "version": "0.79.0+dev.1",
+  "version": "0.79.2",
   "description": "Standalone local daemon for Pi coding agent sessions.",
   "license": "MIT",
   "type": "module",
   "private": true,
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "0.79.0"
+    "@earendil-works/pi-coding-agent": "0.79.2"
   },
   "scripts": {
     "check": "deno task check",
