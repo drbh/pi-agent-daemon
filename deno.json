@@ -10,7 +10,7 @@
     "prepare-release": "deno run --allow-read --allow-write scripts/prepare-release.ts"
   },
   "imports": {
-    "@earendil-works/pi-coding-agent": "npm:@earendil-works/pi-coding-agent@0.79.0"
+    "@earendil-works/pi-coding-agent": "npm:@earendil-works/pi-coding-agent@0.79.7"
   },
   "fmt": {
     "lineWidth": 88,
