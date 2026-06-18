@@ -70,8 +70,8 @@ The ready frame includes the daemon, upstream Pi agent, and protocol versions:
 {
   "ready": true,
   "daemon": "pi-agent-daemon",
-  "version": "0.79.0+dev.1",
-  "pi_agent_version": "0.79.0",
+  "version": "0.79.6",
+  "pi_agent_version": "0.79.6",
   "protocol_version": "4.0.0",
   "transport": "unix"
 }
