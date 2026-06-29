@@ -4,7 +4,7 @@
     "check": "deno check --node-modules-dir=auto src/main.ts",
     "compile": "deno compile -A --node-modules-dir=auto -o dist/pi-agent-daemon src/main.ts",
     "dev": "deno run -A src/main.ts serve --socket /tmp/pi-agent.sock",
-    "e2e": "deno run --allow-net=127.0.0.1 --allow-read --allow-write=/tmp --allow-run=deno tests/e2e.ts",
+    "e2e": "deno run --allow-net --allow-read --allow-write=/tmp --allow-run=deno tests/e2e.ts",
     "fmt": "deno fmt",
     "lint": "deno lint",
     "prepare-release": "deno run --allow-read --allow-write scripts/prepare-release.ts"
