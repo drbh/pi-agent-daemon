@@ -180,6 +180,7 @@ async function handleConnection(
   } catch {
     // Connection reset.
   } finally {
+    daemon.cancelLoginsForWriter(w);
     try {
       conn.close();
     } catch {
@@ -198,6 +199,18 @@ async function dispatch(
   switch (req.method) {
     case "configure":
       daemon.configure(w, req.id, params);
+      break;
+    case "auth_status":
+      daemon.authStatus(w, req.id, params);
+      break;
+    case "auth_login":
+      daemon.authLogin(w, req.id, params);
+      break;
+    case "auth_input":
+      daemon.authInput(w, req.id, params);
+      break;
+    case "auth_cancel":
+      daemon.authCancel(w, req.id, params);
       break;
     case "create_session":
       await daemon.createSession(w, req.id, params);

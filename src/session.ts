@@ -38,15 +38,79 @@ interface ModelRecord {
   provider?: string;
 }
 
+// OAuth callback shapes, mirrored locally from @earendil-works/pi-ai so the
+// daemon does not need a direct dependency on that package's type exports.
+interface OAuthAuthInfo {
+  url: string;
+  instructions?: string;
+}
+
+interface OAuthDeviceCodeInfo {
+  userCode: string;
+  verificationUri: string;
+  intervalSeconds?: number;
+  expiresInSeconds?: number;
+}
+
+interface OAuthPrompt {
+  message: string;
+  placeholder?: string;
+  allowEmpty?: boolean;
+}
+
+interface OAuthSelectOption {
+  id: string;
+  label: string;
+}
+
+interface OAuthSelectPrompt {
+  message: string;
+  options: OAuthSelectOption[];
+}
+
+interface OAuthLoginCallbacks {
+  onAuth: (info: OAuthAuthInfo) => void;
+  onDeviceCode: (info: OAuthDeviceCodeInfo) => void;
+  onProgress?: (message: string) => void;
+  onPrompt: (prompt: OAuthPrompt) => Promise<string>;
+  onSelect: (prompt: OAuthSelectPrompt) => Promise<string | undefined>;
+  signal?: AbortSignal;
+}
+
+interface PendingInput {
+  loginId: number;
+  resolve: (value: string | undefined) => void;
+  reject: (error: Error) => void;
+}
+
 export class AgentDaemon {
   private sessions = new Map<string, SessionHandle>();
   private nextSessionId = 1;
   private authStorage = AuthStorage.inMemory();
   private modelRegistry = ModelRegistry.inMemory(this.authStorage);
+  private nextAuthId = 1;
+  private activeLogins = new Map<
+    number,
+    { controller: AbortController; w: RpcWriter }
+  >();
+  private pendingInputs = new Map<number, PendingInput>();
 
   configure(w: RpcWriter, id: number, params: Record<string, unknown>) {
+    const authPath = params.auth_path as string | undefined;
     const authData = params.auth as Record<string, unknown> | undefined;
-    if (authData) {
+
+    if (authPath !== undefined) {
+      // File-backed storage owns persistence + token refresh + locking. It
+      // takes precedence over an inline `auth` map: the file is the durable
+      // source of truth, and `auth_login` writes straight through to it.
+      if (!authPath.startsWith("/")) {
+        w.sendError(id, "auth_path must be an absolute path");
+        return;
+      }
+      this.authStorage = AuthStorage.create(authPath);
+      this.modelRegistry = ModelRegistry.inMemory(this.authStorage);
+      console.error(`Using file-backed auth at: ${authPath}`);
+    } else if (authData) {
       this.authStorage = AuthStorage.inMemory(authData as never);
       this.modelRegistry = ModelRegistry.inMemory(this.authStorage);
       console.error(`Loaded auth for: ${Object.keys(authData).join(", ")}`);
@@ -89,6 +153,183 @@ export class AgentDaemon {
     }
 
     w.sendResult(id, { configured: true });
+  }
+
+  /**
+   * Report auth status without exposing credential values. With a `provider`,
+   * returns that provider's status; otherwise returns a map covering every
+   * provider that has a credential plus every known OAuth provider. Lets a
+   * client render "Connected as …" without parsing the on-disk auth schema.
+   */
+  authStatus(w: RpcWriter, id: number, params: Record<string, unknown>) {
+    const provider = params.provider as string | undefined;
+    if (provider) {
+      w.sendResult(id, {
+        provider,
+        status: this.authStorage.getAuthStatus(provider),
+      });
+      return;
+    }
+
+    const providers = new Set<string>(this.authStorage.list());
+    for (const p of this.authStorage.getOAuthProviders()) {
+      providers.add(p.id);
+    }
+
+    const statuses: Record<string, unknown> = {};
+    for (const name of providers) {
+      statuses[name] = this.authStorage.getAuthStatus(name);
+    }
+    w.sendResult(id, { statuses });
+  }
+
+  /**
+   * Start an OAuth login flow for a provider (e.g. "anthropic", "openai-codex",
+   * "github-copilot"). The flow runs in the background so this connection's read
+   * loop stays responsive: push callbacks are streamed as events, and any
+   * interactive prompt/selection is answered by a follow-up `auth_input` request.
+   * On success the result carries the new credential plus the full auth map so
+   * the caller can persist it and re-`configure` later.
+   *
+   * An optional `method` selects a provider's login method up front (e.g.
+   * "device_code" for openai-codex), short-circuiting the `auth_select`
+   * round-trip so that — for providers that offer device code — the client can
+   * complete login as a pure one-directional event stream. Providers that never
+   * present a choice (e.g. anthropic) ignore it.
+   */
+  authLogin(w: RpcWriter, id: number, params: Record<string, unknown>) {
+    const provider = params.provider as string | undefined;
+    if (!provider) {
+      w.sendError(id, "auth_login requires a 'provider'");
+      return;
+    }
+
+    const method = params.method as string | undefined;
+
+    const controller = new AbortController();
+    this.activeLogins.set(id, { controller, w });
+
+    // Capture the storage in use now; configure() may swap it concurrently.
+    const storage = this.authStorage;
+
+    const callbacks: OAuthLoginCallbacks = {
+      onAuth: (info) =>
+        w.sendEvent(id, "auth_url", {
+          url: info.url,
+          instructions: info.instructions ?? null,
+        }),
+      onDeviceCode: (info) =>
+        w.sendEvent(id, "device_code", {
+          user_code: info.userCode,
+          verification_uri: info.verificationUri,
+          interval_seconds: info.intervalSeconds ?? null,
+          expires_in_seconds: info.expiresInSeconds ?? null,
+        }),
+      onProgress: (message) => w.sendEvent(id, "auth_progress", { message }),
+      onPrompt: (prompt) =>
+        this.requestInput(w, id, "auth_prompt", {
+          message: prompt.message,
+          placeholder: prompt.placeholder ?? null,
+          allow_empty: prompt.allowEmpty ?? false,
+        }).then((value) => {
+          if (value === undefined) {
+            throw new Error("login cancelled");
+          }
+          return value;
+        }),
+      onSelect: (prompt) => {
+        if (method !== undefined) {
+          if (!prompt.options.some((option) => option.id === method)) {
+            const ids = prompt.options.map((option) => option.id).join(", ");
+            return Promise.reject(
+              new Error(`unknown login method: ${method} (expected one of: ${ids})`),
+            );
+          }
+          return Promise.resolve(method);
+        }
+        return this.requestInput(w, id, "auth_select", {
+          message: prompt.message,
+          options: prompt.options,
+        });
+      },
+      signal: controller.signal,
+    };
+
+    storage
+      .login(provider as never, callbacks as never)
+      .then(() => {
+        w.sendResult(id, {
+          provider,
+          credential: storage.get(provider) ?? null,
+          auth: storage.getAll(),
+        });
+      })
+      .catch((err: unknown) => {
+        w.sendError(id, err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        this.activeLogins.delete(id);
+        this.rejectInputsForLogin(id, "login finished");
+      });
+  }
+
+  /** Answer a pending `auth_prompt`/`auth_select`. A null/absent value cancels. */
+  authInput(w: RpcWriter, id: number, params: Record<string, unknown>) {
+    const promptId = params.prompt_id as number | undefined;
+    const pending = promptId === undefined
+      ? undefined
+      : this.pendingInputs.get(promptId);
+    if (promptId === undefined || !pending) {
+      w.sendError(id, `unknown prompt: ${promptId}`);
+      return;
+    }
+
+    this.pendingInputs.delete(promptId);
+    const value = params.value;
+    pending.resolve(value === undefined || value === null ? undefined : String(value));
+    w.sendResult(id, {});
+  }
+
+  /** Abort an in-flight login started with the given `login_id`. */
+  authCancel(w: RpcWriter, id: number, params: Record<string, unknown>) {
+    const loginId = params.login_id as number | undefined;
+    if (loginId !== undefined) {
+      this.activeLogins.get(loginId)?.controller.abort();
+      this.rejectInputsForLogin(loginId, "login cancelled");
+    }
+    w.sendResult(id, {});
+  }
+
+  /** Tear down any logins owned by a connection that has gone away. */
+  cancelLoginsForWriter(w: RpcWriter) {
+    for (const [loginId, login] of this.activeLogins) {
+      if (login.w === w) {
+        login.controller.abort();
+        this.rejectInputsForLogin(loginId, "connection closed");
+      }
+    }
+  }
+
+  private requestInput(
+    w: RpcWriter,
+    loginId: number,
+    event: string,
+    data: Record<string, unknown>,
+  ): Promise<string | undefined> {
+    const promptId = this.nextAuthId++;
+    w.sendEvent(loginId, event, { ...data, prompt_id: promptId });
+    return new Promise((resolve, reject) => {
+      this.pendingInputs.set(promptId, { loginId, resolve, reject });
+    });
+  }
+
+  private rejectInputsForLogin(loginId: number, reason: string) {
+    for (const [promptId, pending] of this.pendingInputs) {
+      if (pending.loginId === loginId) {
+        this.pendingInputs.delete(promptId);
+        pending.reject(new Error(reason));
+      }
+    }
   }
 
   async createSession(
