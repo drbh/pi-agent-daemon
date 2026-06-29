@@ -58,11 +58,52 @@ Server result:
 
 Supported methods:
 
-- `configure`: `{ providers?, auth? }`
+- `configure`: `{ providers?, auth?, auth_path? }`
 - `create_session`: `{ system_prompt?, tools?, model?, cwd? }`
 - `prompt`: `{ session_id, message }`
 - `dispose_session`: `{ session_id }`
+- `auth_status`: `{ provider? }` — report auth status without exposing credentials (one
+  provider, or a map of all known/configured providers)
+- `auth_login`: `{ provider, method? }` — start an OAuth login (`anthropic`,
+  `openai-codex`, `github-copilot`, …); `method` picks a login method up front (e.g.
+  `device_code`) to skip the `auth_select` round-trip
+- `auth_input`: `{ prompt_id, value? }` — answer a pending prompt/selection (omit/null
+  `value` to cancel)
+- `auth_cancel`: `{ login_id }` — abort an in-flight login
 - `shutdown`: `{}`
+
+### OAuth login flow
+
+`auth_login` runs in the background so the connection keeps accepting requests while the
+user authenticates. It streams events under the request `id`:
+
+- `auth_url`: `{ url, instructions }` — open this URL to authorize
+- `device_code`: `{ user_code, verification_uri, interval_seconds, expires_in_seconds }`
+- `auth_progress`: `{ message }`
+- `auth_prompt`: `{ prompt_id, message, placeholder, allow_empty }` — reply with
+  `auth_input`
+- `auth_select`: `{ prompt_id, message, options: [{ id, label }] }` — reply with
+  `auth_input` (the selected option `id`)
+
+To avoid re-authenticating on every launch, a client can name a file-backed store with
+`configure { auth_path }` (absolute path). The daemon then loads, saves, refreshes, and
+locks credentials in that file, so `auth_login` persists straight through and later
+launches only need to pass `auth_path` again — no inline `auth` map and no client-side
+refresh logic. `auth_path` takes precedence over an inline `auth` map.
+
+On success the result carries the new credential and the full auth map so the caller can
+persist it and re-`configure` later:
+
+```json
+{
+  "id": 7,
+  "result": {
+    "provider": "openai-codex",
+    "credential": { "type": "oauth", "...": "..." },
+    "auth": { "openai-codex": { "...": "..." } }
+  }
+}
+```
 
 The ready frame includes the daemon, upstream Pi agent, and protocol versions:
 
@@ -70,7 +111,7 @@ The ready frame includes the daemon, upstream Pi agent, and protocol versions:
 {
   "ready": true,
   "daemon": "pi-agent-daemon",
-  "version": "0.79.0+dev.1",
+  "version": "0.79.0+dev.2",
   "pi_agent_version": "0.79.0",
   "protocol_version": "4.0.0",
   "transport": "unix"

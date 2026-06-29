@@ -1,5 +1,5 @@
 export const DAEMON_NAME = "pi-agent-daemon";
-export const DAEMON_VERSION = "0.79.0+dev.1";
+export const DAEMON_VERSION = "0.79.0+dev.2";
 export const PI_AGENT_VERSION = "0.79.0";
 export const PROTOCOL_VERSION = "4.0.0";
 

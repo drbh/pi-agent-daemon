@@ -197,6 +197,26 @@ class RpcClient {
     return this.request("dispose_session", { session_id: sessionId });
   }
 
+  configureAuthPath(authPath: string) {
+    return this.request("configure", { auth_path: authPath });
+  }
+
+  authStatus(provider?: string) {
+    return this.request("auth_status", provider ? { provider } : {});
+  }
+
+  async expectError(
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<string> {
+    try {
+      await this.request(method, params);
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    }
+    throw new Error(`expected ${method} to fail, but it succeeded`);
+  }
+
   shutdown() {
     return this.request("shutdown", {});
   }
@@ -255,6 +275,54 @@ class RpcClient {
       }
       this.buffer += this.decoder.decode(chunk.subarray(0, n), { stream: true });
     }
+  }
+}
+
+async function checkAuthStatusAndPath(client: RpcClient) {
+  // No provider: a map covering every known OAuth provider.
+  const all = await client.authStatus();
+  const statuses = all.statuses as Record<string, { configured?: boolean }>;
+  if (!statuses || typeof statuses !== "object") {
+    throw new Error(`expected statuses map: ${JSON.stringify(all)}`);
+  }
+  for (const provider of ["anthropic", "openai-codex", "github-copilot"]) {
+    if (!(provider in statuses)) {
+      throw new Error(
+        `auth_status missing known provider ${provider}: ${JSON.stringify(statuses)}`,
+      );
+    }
+  }
+
+  // Specific provider with no credential: not configured.
+  const before = await client.authStatus("anthropic");
+  if ((before.status as { configured?: boolean }).configured !== false) {
+    throw new Error(`expected anthropic unconfigured: ${JSON.stringify(before)}`);
+  }
+
+  // auth_path must be absolute.
+  const relativeError = await client.expectError("configure", {
+    auth_path: "relative/auth.json",
+  });
+  if (!/absolute/i.test(relativeError)) {
+    throw new Error(`unexpected auth_path error: ${JSON.stringify(relativeError)}`);
+  }
+
+  // File-backed auth: a credential on disk is reflected by auth_status.
+  const authFile = `/tmp/pi-agent-daemon-e2e-auth-${crypto.randomUUID()}.json`;
+  await Deno.writeTextFile(
+    authFile,
+    JSON.stringify({ anthropic: { type: "api_key", key: "stored-key" } }),
+  );
+  try {
+    await client.configureAuthPath(authFile);
+    const after = await client.authStatus("anthropic");
+    if ((after.status as { configured?: boolean }).configured !== true) {
+      throw new Error(
+        `expected anthropic configured from file: ${JSON.stringify(after)}`,
+      );
+    }
+  } finally {
+    await safeRemove(authFile);
   }
 }
 
@@ -448,6 +516,34 @@ async function main() {
         throw new Error("expected streaming chat-completions request");
       }
     }
+
+    const unknownProviderError = await client.expectError("auth_login", {
+      provider: "definitely-not-a-provider",
+    });
+    if (!/provider/i.test(unknownProviderError)) {
+      throw new Error(
+        `unexpected auth_login error: ${JSON.stringify(unknownProviderError)}`,
+      );
+    }
+
+    const missingProviderError = await client.expectError("auth_login", {});
+    if (!/provider/i.test(missingProviderError)) {
+      throw new Error(
+        `unexpected auth_login error: ${JSON.stringify(missingProviderError)}`,
+      );
+    }
+
+    const unknownPromptError = await client.expectError("auth_input", {
+      prompt_id: 999999,
+      value: "nope",
+    });
+    if (!/unknown prompt/i.test(unknownPromptError)) {
+      throw new Error(
+        `unexpected auth_input error: ${JSON.stringify(unknownPromptError)}`,
+      );
+    }
+
+    await checkAuthStatusAndPath(client);
 
     await client.disposeSession(sessionId);
     await client.shutdown();
